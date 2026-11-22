@@ -6,7 +6,7 @@
 use super::{
     InsertFailure, REPAIR_LIMIT,
     connection::{Conn, InFlight},
-    log::{End, Hex, Opt, Tag, direction_str, elapsed_ms, event, request_ended},
+    log::{End, Hex, Opt, Tag, Token, direction_str, elapsed_ms, event, request_ended},
     warp::warp_token,
 };
 use crate::{log, platform::PlatformRef};
@@ -280,7 +280,16 @@ impl<P: PlatformRef> Conn<'_, P> {
                     self.cursor = Some(s.tree.finalized().hash());
                     self.fallback = true;
                 }
-                Err(_) => return Err(End::InsertFailed),
+                Err(error) => {
+                    event!(
+                        self,
+                        "jam-header-rejected",
+                        slot = self.peer_index,
+                        block_slot = block_slot,
+                        error = Token(&error)
+                    );
+                    return Err(End::InsertFailed);
+                }
             }
             self.local_progress = true;
         }
@@ -342,7 +351,7 @@ impl<P: PlatformRef> Conn<'_, P> {
     /// header, or an ascending batch from the cursor or the best block.
     pub(super) async fn request_blocks(&mut self) -> Result<(), End> {
         let s = self.state.lock().await;
-        if s.tree.len() + 1 >= s.max_blocks && s.proof_owner.is_some() {
+        if s.pause_imports_for_proof() {
             // The proof already in flight must get a turn before more imports.
             return Ok(());
         }

@@ -478,6 +478,7 @@ impl State {
                 }
                 Ok(Some(Ok(result))) => Ok(result),
                 Ok(Some(Err(StateReadError::Unavailable))) => Err("Unavailable"),
+                Ok(Some(Err(StateReadError::InvalidProof))) => Err("InvalidProof"),
                 Err(_) => Err("Cancelled"),
             };
             let read = self.discovery.read.take()?;

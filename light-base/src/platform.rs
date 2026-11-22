@@ -223,6 +223,21 @@ pub trait PlatformRef: UnwindSafe + Clone + Send + Sync + 'static {
     ///
     fn connect_multistream(&self, address: MultiStreamAddress) -> Self::MultiStreamConnectFuture;
 
+    /// Opens a WebTransport connection with a caller-authenticated P-256 identity.
+    ///
+    /// The default implementation retains the supplied certificate-hash policy.
+    /// Native platforms may also reproduce explicitly supported historical
+    /// certificate encodings from this uncompressed SEC1 public key. This is
+    /// never trust-on-first-use and must not bypass TLS proof of key possession.
+    fn connect_multistream_with_peer_key(
+        &self,
+        address: MultiStreamAddress,
+        peer_public_key: [u8; 65],
+    ) -> Self::MultiStreamConnectFuture {
+        let _ = peer_public_key;
+        self.connect_multistream(address)
+    }
+
     /// Queues the opening of an additional outbound substream.
     ///
     /// The substream, once opened, must be yielded by [`PlatformRef::next_substream`].

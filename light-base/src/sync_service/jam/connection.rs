@@ -189,7 +189,16 @@ pub(super) async fn connect_once<P: PlatformRef>(
     }
     log!(platform, Debug, log_name, "jam-connect");
     let connected = future::or(
-        async { Some(platform.connect_multistream(address).await) },
+        async {
+            Some(
+                platform
+                    .connect_multistream_with_peer_key(
+                        address,
+                        peer.identity.to_uncompressed_sec1(),
+                    )
+                    .await,
+            )
+        },
         async {
             platform.sleep(TIMEOUT).await;
             None
@@ -426,7 +435,7 @@ pub(super) async fn drive_connection<P: PlatformRef>(
     if root_probe.is_some_and(|hash| hash != handshake.final_.hash) {
         *root_probe = None;
     }
-    let Ok(connection) = net::Connection::new(
+    let Ok(mut connection) = net::Connection::new(
         params.clone(),
         handshake,
         net::Limits {
@@ -440,7 +449,19 @@ pub(super) async fn drive_connection<P: PlatformRef>(
     ) else {
         return End::Setup;
     };
+    if connection
+        .set_state_message_size(32 * 1024 * 1024 + 496 * 64)
+        .is_err()
+    {
+        return End::Setup;
+    }
     let started = platform.now();
+    // Acquire once before the struct literal: two temporary lock guards in
+    // one initializer otherwise live through the statement and deadlock.
+    let (continuous, warp_revision) = {
+        let s = state.lock().await;
+        (s.sdk.continuous, s.warp_revision)
+    };
     let mut conn = Conn {
         platform,
         log_name,
@@ -470,10 +491,11 @@ pub(super) async fn drive_connection<P: PlatformRef>(
         state_requested: None,
         advertised: None,
         advertisement_revision: 0,
-        warped: false,
+        // JAMSDK deliberately follows continuous ancestry: warp proofs are not chain-bound.
+        warped: continuous,
         warp: None,
         warp_requested: None,
-        warp_revision: state.lock().await.warp_revision,
+        warp_revision,
         resets_without_code: 0,
         local_progress: false,
     };
@@ -529,7 +551,7 @@ impl<P: PlatformRef> Conn<'_, P> {
             if normal_sync && s.tree.len() >= s.max_blocks && s.proof_owner.is_none() {
                 return Err(End::TreeFull);
             }
-            !normal_sync || (s.proof_owner.is_some() && s.tree.len() + 1 >= s.max_blocks)
+            !normal_sync || s.pause_imports_for_proof()
         };
         if !pause_imports && !self.imports.is_empty() {
             self.import_next(&now).await?;
@@ -568,6 +590,35 @@ impl<P: PlatformRef> Conn<'_, P> {
 
     /// Ends the connection once one of its deadlines has passed.
     async fn check_deadlines(&mut self, now: &P::Instant) -> Result<(), End> {
+        let read_canceled = self.state_requested.is_some()
+            && self
+                .state
+                .lock()
+                .await
+                .reads
+                .canceled_owner(self.peer_index);
+        if read_canceled && let Some(r) = self.state_requested.take() {
+            let _ = self
+                .connection
+                .cancel_request(r.id, net::RequestError::Rejected);
+            self.streams.retain(|stream| stream.request != Some(r.id));
+            self.state
+                .lock()
+                .await
+                .reads
+                .release(self.peer_index, false);
+            request_ended!(
+                self,
+                "jam-state-request-ended",
+                r,
+                "cancelled",
+                reason = "owner-cancelled"
+            );
+            self.local_progress = true;
+            // If opening is still pending, retain its exact request ID until
+            // the platform returns it. accept() drops that retired stream;
+            // it must never attach to a replacement read on this same peer.
+        }
         if !self.handshaken && now.clone() - self.started.clone() >= TIMEOUT {
             return Err(End::HandshakeTimeout);
         }
@@ -910,6 +961,14 @@ impl<P: PlatformRef> Conn<'_, P> {
                 let Some((kind, _)) = self.opening.take() else {
                     return Err(End::ProtocolError);
                 };
+                if let net::SubstreamKind::Ce129 { request_id } = kind
+                    && !InFlight::holds(&self.state_requested, Some(request_id))
+                {
+                    // Completion of an outbound opening canceled by its owner.
+                    // Dropping only this stream resets it without affecting UP0
+                    // or another request that now owns the shared read slot.
+                    return Ok(());
+                }
                 request = match kind {
                     net::SubstreamKind::Ce128 { request_id }
                     | net::SubstreamKind::Ce129 { request_id }

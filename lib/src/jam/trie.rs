@@ -3,7 +3,7 @@
 //! Bounded JAM state range proofs (GP 0.8, appendix D).
 //! Roots must be authenticated by the caller; the requested block is not itself
 //! cryptographically bound by a proof. Keys and branch paths are MSB-first.
-//! Limits: 496 boundary nodes, one MiB of encoded entries, depth 248, and
+//! Limits: 496 boundary nodes, 32 MiB of encoded entries, depth 248, and
 //! 262144 traversal/reconstruction steps shared across both completeness walks.
 
 use super::{
@@ -18,7 +18,7 @@ pub use super::codec::state_key;
 pub type StateKey = [u8; 31];
 pub type Node = [u8; 64];
 const MAX_NODES: usize = 496;
-const MAX_BYTES: usize = 1024 * 1024;
+const MAX_BYTES: usize = 32 * 1024 * 1024;
 const MAX_WORK: usize = 262144;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -164,13 +164,15 @@ pub fn verify_range(
         if value.len() > MAX_BYTES {
             return Err(ProofError::Limit);
         }
-        // Canonical natural length for a value bounded by one MiB.
+        // Canonical natural length for a value bounded by 32 MiB.
         let prefix = if value.len() < 128 {
             1
         } else if value.len() < 16384 {
             2
-        } else {
+        } else if value.len() < 2_097_152 {
             3
+        } else {
+            4
         };
         bytes = bytes
             .checked_add(31 + prefix)
@@ -382,6 +384,22 @@ fn subtree(
             Ok(blake2b_256(&node))
         }
     }
+}
+
+/// GP 0.8.0 Appendix D: commit a complete, ordered state map.
+/// The caller supplies trusted genesis data; this does not authenticate it.
+pub fn state_root(entries: &[(StateKey, Vec<u8>)]) -> Result<Hash, ProofError> {
+    if entries.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+        return Err(ProofError::UnsortedEntries);
+    }
+    let total = entries
+        .iter()
+        .try_fold(0usize, |n, (_, value)| n.checked_add(value.len() + 31))
+        .ok_or(ProofError::Limit)?;
+    if total > MAX_BYTES {
+        return Err(ProofError::Limit);
+    }
+    subtree(entries, 0, &Cell::new(MAX_WORK))
 }
 
 pub fn verify_value(

@@ -65,6 +65,11 @@ pub enum ConfigError {
         index: usize,
         source: P256PeerIdParseError,
     },
+    /// SDK ancestry must start at a caller-trusted posterior commitment.
+    #[display(
+        "JAM SDK requires a complete genesis_state or an explicit checkpoint.state_root at its selected trust anchor"
+    )]
+    MissingTrustedStateRoot,
     /// The trusted starting state is invalid.
     #[display("JAM starting state: {_0:?}")]
     StartingState(StateError),
@@ -90,6 +95,7 @@ pub enum ConfigError {
 }
 
 pub(crate) struct Config {
+    sdk: sdk::SdkState,
     params: Params,
     tree: HeaderTree,
     /// The chain spec's `bootnodes_p256`.
@@ -105,6 +111,19 @@ pub(crate) struct Config {
 
 impl Config {
     pub(crate) fn from_spec(spec: &JamChainSpec) -> Result<Self, ConfigError> {
+        if spec.jamsdk_disable_warp()
+            && spec
+                .checkpoint()
+                .map_or(spec.genesis_state_root(), |checkpoint| {
+                    checkpoint.state_root
+                })
+                .is_none()
+        {
+            // A genesis header hash and shared initial authorities do not bind
+            // the chain's posterior state. No peer certificate can supply this
+            // missing initial trust decision on the caller's behalf.
+            return Err(ConfigError::MissingTrustedStateRoot);
+        }
         let params = spec.params().clone();
         let (header_bytes, limits) = memory_limits(&params)?;
         let max_blocks = limits.max_blocks;
@@ -147,6 +166,7 @@ impl Config {
         let tree = HeaderTree::new(params.clone(), root, limits)
             .map_err(|_| ConfigError::AnchorExceedsTreeBudget)?;
         Ok(Self {
+            sdk: sdk::SdkState::from_spec(spec),
             params,
             tree,
             peers,
@@ -203,6 +223,7 @@ fn memory_limits(params: &Params) -> Result<(usize, tree::Config), ConfigError> 
 }
 
 struct State {
+    sdk: sdk::SdkState,
     reads: StateReads,
     tree: HeaderTree,
     params: Params,
@@ -226,6 +247,7 @@ struct State {
 
 #[derive(Debug)]
 enum InsertFailure {
+    RootMismatch,
     ResourceLimit,
     Tree(tree::InsertError),
 }
@@ -256,10 +278,41 @@ impl State {
         }
     }
 
+    /// Leave room for a pending finality certificate to prune the old epochs.
+    /// The header-count cap alone is insufficient: a fast peer can fill all
+    /// shared epoch records before a slower CE130 response is serviced.
+    fn pause_imports_for_proof(&self) -> bool {
+        if self.proof_owner.is_none() && !self.sdk.continuous {
+            return false;
+        }
+        let epoch_bytes = usize::try_from(self.params.epoch_len)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(160)
+            .saturating_add(usize::from(self.params.max_validators).saturating_mul(256))
+            .saturating_add(2048);
+        (self.proof_owner.is_some() && self.tree.len().saturating_add(1) >= self.max_blocks)
+            || self.tree.epoch_records().saturating_add(1)
+                >= self.tree_config.max_epoch_records.get()
+            || self
+                .tree
+                .retained_bytes()
+                .saturating_add(epoch_bytes)
+                .saturating_add(self.header_bytes)
+                >= self.tree_config.max_bytes
+    }
+
     /// Reports a new block to subscribers with its canonical JAM encoding.
     fn insert(&mut self, header: Header, now: u64) -> Result<(), InsertFailure> {
         if self.stopped || header.encode(&self.params).len() > self.header_bytes {
             return Err(InsertFailure::ResourceLimit);
+        }
+        if self.sdk.continuous
+            && self
+                .sdk
+                .certified_root(&header.parent)
+                .is_some_and(|root| root != header.prior_state_root)
+        {
+            return Err(InsertFailure::RootMismatch);
         }
         let hash = header.hash(&self.params);
         let extends_root = header.parent == self.tree.finalized().hash();
@@ -297,6 +350,7 @@ impl State {
             }
             Err(tree::InsertError::Full) => {
                 self.stopped = true;
+                self.reads.abort();
                 self.subscribers.clear();
                 Err(InsertFailure::Tree(tree::InsertError::Full))
             }
@@ -311,6 +365,7 @@ impl State {
 /// JAM has no runtime and no Substrate peer or warp sync state.
 pub(crate) struct JamSyncService {
     to_background: async_channel::Sender<SubscribeRequest>,
+    to_sdk: Option<async_channel::Sender<sdk::Request>>,
 }
 
 /// See [`JamSyncService::subscribe_all`].
@@ -324,11 +379,21 @@ impl JamSyncService {
     /// Spawns the driver of the chain `config` describes.
     pub(crate) fn new<P: PlatformRef>(platform: P, log_name: String, config: Config) -> Self {
         let (to_background, from_foreground) = async_channel::bounded(16);
+        let (to_sdk, sdk_requests) = async_channel::bounded(64);
         platform.spawn_task(
             alloc::format!("jam-sync-{log_name}").into(),
-            run(platform.clone(), log_name, config, from_foreground),
+            run(
+                platform.clone(),
+                log_name,
+                config,
+                from_foreground,
+                sdk_requests,
+            ),
         );
-        Self { to_background }
+        Self {
+            to_background,
+            to_sdk: Some(to_sdk),
+        }
     }
 
     /// Like [`SyncService::subscribe_all`](super::SyncService::subscribe_all). A
@@ -357,6 +422,7 @@ async fn run<P: PlatformRef>(
     log_name: String,
     config: Config,
     rx: async_channel::Receiver<SubscribeRequest>,
+    sdk_requests: async_channel::Receiver<sdk::Request>,
 ) {
     // Slots keep their index for life; only their candidate changes.
     let slots = MAX_PEERS;
@@ -390,6 +456,7 @@ async fn run<P: PlatformRef>(
         );
     }
     let state = Arc::new(async_lock::Mutex::new(State {
+        sdk: config.sdk,
         reads: StateReads::new(slots),
         tree: config.tree,
         params: config.params.clone(),
@@ -408,12 +475,32 @@ async fn run<P: PlatformRef>(
         discovery: Discovery::new(pool),
     }));
     let foreground = async {
-        while let Ok(request) = rx.recv().await {
-            let snapshot = state
-                .lock()
-                .await
-                .subscribe(request.buffer_size, request.runtime_interest);
-            let _ = request.send_back.send(snapshot);
+        loop {
+            enum Foreground {
+                Subscribe(Result<SubscribeRequest, async_channel::RecvError>),
+                Sdk(Result<sdk::Request, async_channel::RecvError>),
+            }
+            match future::or(async { Foreground::Subscribe(rx.recv().await) }, async {
+                Foreground::Sdk(sdk_requests.recv().await)
+            })
+            .await
+            {
+                Foreground::Subscribe(Ok(request)) => {
+                    let snapshot = state
+                        .lock()
+                        .await
+                        .subscribe(request.buffer_size, request.runtime_interest);
+                    let _ = request.send_back.send(snapshot);
+                }
+                Foreground::Sdk(Ok(request)) => {
+                    let result = state
+                        .lock()
+                        .await
+                        .sdk_query(&request.method, &request.params);
+                    let _ = request.send_back.send(result);
+                }
+                _ => break,
+            }
         }
     };
     // Peer drivers must yield to the platform executor, not to a FuturesUnordered
@@ -468,6 +555,8 @@ mod discovery;
 mod grandpa;
 mod log;
 mod reads;
+mod sdk;
+pub(crate) use sdk::SdkError;
 mod warp;
 
 #[cfg(all(test, feature = "std"))]

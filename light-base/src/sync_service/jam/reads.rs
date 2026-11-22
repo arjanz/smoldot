@@ -60,6 +60,7 @@ impl StateReadResult {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StateReadError {
     Unavailable,
+    InvalidProof,
 }
 
 pub(super) struct StateReads {
@@ -70,6 +71,7 @@ pub(super) struct StateReads {
     pub(super) owner: Option<usize>,
     pub(super) attempts: u8,
     peers: usize,
+    invalid_proof: bool,
 }
 
 impl StateReads {
@@ -79,6 +81,15 @@ impl StateReads {
             owner: None,
             attempts: 0,
             peers: peers.min(MAX_PEERS),
+            invalid_proof: false,
+        }
+    }
+
+    /// A terminal chain stop releases the current request and its waiters.
+    pub(super) fn abort(&mut self) {
+        self.owner = None;
+        if let Some((_, tx)) = self.pending.take() {
+            let _ = tx.send(Err(StateReadError::Unavailable));
         }
     }
 
@@ -87,7 +98,11 @@ impl StateReads {
             && (0..self.peers).all(|peer| self.attempts & (1u8 << peer) != 0)
             && let Some((_, tx)) = self.pending.take()
         {
-            let _ = tx.send(Err(StateReadError::Unavailable));
+            let _ = tx.send(Err(if self.invalid_proof {
+                StateReadError::InvalidProof
+            } else {
+                StateReadError::Unavailable
+            }));
         }
     }
     /// Bounded in-process API: caller supplies the authenticated root and trust.
@@ -119,6 +134,7 @@ impl StateReads {
         let (tx, rx) = futures_channel::oneshot::channel();
         self.pending = Some((read, tx));
         self.attempts = 0;
+        self.invalid_proof = false;
         self.finish_exhausted();
         Ok(rx)
     }
@@ -139,6 +155,14 @@ impl StateReads {
         self.attempts |= bit;
         self.owner = Some(peer);
         Some(read.request.clone())
+    }
+
+    pub(super) fn canceled_owner(&self, peer: usize) -> bool {
+        self.owner == Some(peer)
+            && self
+                .pending
+                .as_ref()
+                .is_some_and(|(_, tx)| tx.is_canceled())
     }
 
     pub(super) fn release(&mut self, peer: usize, transient: bool) {
@@ -167,6 +191,7 @@ impl StateReads {
         let range = match trie::verify_range(&read.root, &read.request, response) {
             Ok(range) => range,
             Err(error) => {
+                self.invalid_proof = true;
                 self.finish_exhausted();
                 return Err(error);
             }
@@ -193,16 +218,28 @@ impl State {
         max_size: u32,
     ) -> Option<StateRead> {
         let at = self.tree.finalized().hash();
-        let child = self
-            .tree
-            .ancestors(&self.tree.best().hash())
-            .find(|child| child.parent() == at)?;
-        let root = child.encoded().get(32..64)?.try_into().ok()?;
+        let certified = self
+            .sdk
+            .continuous
+            .then(|| self.sdk_context(&at, false).ok())
+            .flatten();
+        let (root, trust, root_header) = if let Some(context) = certified {
+            (context.root, Trust::Finalized, Some(at))
+        } else {
+            // Header-only legacy discovery can use an authenticated child's root
+            // as liveness data. It is never returned by the SDK as finalized.
+            let child = self
+                .tree
+                .ancestors(&self.tree.best().hash())
+                .find(|child| child.parent() == at)?;
+            let root = child.encoded().get(32..64)?.try_into().ok()?;
+            (root, Trust::Authenticated, Some(child.hash()))
+        };
         Some(StateRead {
             at,
             root,
-            trust: Trust::Authenticated,
-            root_header: Some(child.hash()),
+            trust,
+            root_header,
             request: StateRequest {
                 block: at,
                 start,

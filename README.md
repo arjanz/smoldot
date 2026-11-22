@@ -1,3 +1,19 @@
+# JAMSDK native JAM integration
+
+This fork preserves Parity's JAM prototype at
+`fb3eb3bc7c30212cb1ce782d4281032d9a738785` and adds a native, embedded
+GP 0.8.0 light backend for Python JAMSDK. The original Substrate components
+remain available. See [the native profile and API](docs/jamsdk-native.md).
+
+The SDK profile uses continuous header ancestry, genuine JAM GRANDPA posterior
+roots and CE 129 inclusion/absence proofs. Native WebTransport authenticates
+pinned P-256 peers, including the public PolkaJAM 0.1.29 certificate/CONNECT
+profile. It requires a complete trusted genesis state or a caller-trusted
+checkpoint posterior root. It never falls back to an external RPC node.
+
+The fork retains upstream licensing. Python bindings are maintained separately
+in `JAMdotTech/py-smoldot-light`; the Python SDK lives in `py-jam-sdk`.
+
 # Introduction
 
 `smoldot` is an alternative client of [Substrate](https://github.com/paritytech/substrate)-based chains, including [Polkadot](https://github.com/paritytech/polkadot/).

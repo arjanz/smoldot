@@ -28,7 +28,10 @@ fn rpc_snapshot_with(
     let root = header_bytes(0);
     let (notifications, new_blocks) = async_channel::bounded(16);
     let (to_background, requests) = async_channel::bounded(16);
-    let sync_service = Arc::new(JamSyncService { to_background });
+    let sync_service = Arc::new(JamSyncService {
+        to_background,
+        to_sdk: None,
+    });
     platform.spawn_task("rpc-snapshot-test".into(), {
         let root = root.clone();
         async move {
@@ -405,6 +408,13 @@ fn jam_rpc_answers_its_methods_and_nothing_else() {
             "jamHead_unstable_unfollow",
             "jamHead_unstable_unpin",
             "rpc_methods",
+            "jam_parameters",
+            "jam_block",
+            "jam_parent",
+            "jam_header",
+            "jam_verificationContext",
+            "jam_stateValue",
+            "jam_cancel",
         ]);
         assert_eq!(
             rpc_call(&frontend, "rpc_methods", json!([])).await["result"],

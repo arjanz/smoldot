@@ -215,6 +215,7 @@ enum UpState {
 pub struct Connection {
     params: Params,
     limits: Limits,
+    state_message_size: usize,
     handshake: Vec<u8>,
     up: UpState,
     streams: Vec<(SubstreamId, Stream)>,
@@ -247,6 +248,7 @@ impl Connection {
         }
         Ok(Self {
             params,
+            state_message_size: limits.max_message_size,
             limits,
             handshake,
             up: UpState::Needed,
@@ -255,6 +257,20 @@ impl Connection {
             next_request: 0,
             closed: false,
         })
+    }
+
+    /// Set a separate hard CE129 ceiling before opening streams. This leaves
+    /// header/block budgets unchanged and remains bounded to 32MiB plus proof nodes.
+    pub fn set_state_message_size(&mut self, max: usize) -> Result<(), Error> {
+        if !(98..=32 * 1024 * 1024 + 496 * 64).contains(&max)
+            || !self.streams.is_empty()
+            || !self.pending.is_empty()
+            || self.up != UpState::Needed
+        {
+            return Err(Error::InvalidState);
+        }
+        self.state_message_size = max;
+        Ok(())
     }
 
     fn occupied(&self) -> usize {
@@ -310,7 +326,7 @@ impl Connection {
                     .ok_or(Error::InvalidState)?;
                 let stream = match &self.pending[position].request {
                     Request::State(request) => Stream::Ce129(Box::new(
-                        ce129::Ce129::new(request_id, request, self.limits.max_message_size)
+                        ce129::Ce129::new(request_id, request, self.state_message_size)
                             .map_err(Error::Protocol)?,
                     )),
                     Request::Block(request) => Stream::Ce128(Box::new(
@@ -410,12 +426,12 @@ impl Connection {
         if request.start > request.end || request.max_size == 0 {
             return Err(Error::InvalidRequest);
         }
-        if self.limits.max_message_size < 98 {
+        if self.state_message_size < 98 {
             return Err(Error::Limit);
         }
         // Server size excludes natural prefixes. Every entry costs at least 31
         // server-counted bytes, and its prefix is at most nine bytes.
-        let budget = self.limits.max_message_size.min(1024 * 1024) / 40 * 31;
+        let budget = self.state_message_size.min(32 * 1024 * 1024) / 40 * 31;
         request.max_size = request
             .max_size
             .min(u32::try_from(budget).map_err(|_| Error::Limit)?);
@@ -599,7 +615,7 @@ impl Connection {
                     progress.finish_write = true;
                     Ok(None)
                 } else {
-                    ce.read(&mut remaining, peer_fin, self.limits.max_message_size)
+                    ce.read(&mut remaining, peer_fin, self.state_message_size)
                 }
             }
             Stream::Incoming => Ok(None),

@@ -329,3 +329,106 @@ fn three_resets_without_code_in_a_row_end_the_connection() {
         assert_eq!(platform.0.lock().unwrap().io.state_requests.len(), 6);
     });
 }
+
+#[test]
+fn terminal_stop_releases_proof_owner_and_pending_waiter() {
+    smol::block_on(async {
+        let mut reads = StateReads::default();
+        let rx = reads
+            .start(StateRead {
+                at: [1; 32],
+                root: [2; 32],
+                trust: Trust::Finalized,
+                root_header: Some([1; 32]),
+                request: StateRequest {
+                    block: [1; 32],
+                    start: [0; 31],
+                    end: [0; 31],
+                    max_size: 1,
+                },
+            })
+            .unwrap();
+        assert!(reads.reserve(0).is_some());
+        reads.abort();
+        assert_eq!(rx.await.unwrap().unwrap_err(), StateReadError::Unavailable);
+        assert!(reads.owner.is_none() && reads.pending.is_none());
+    });
+}
+
+#[test]
+fn canceled_inflight_state_read_releases_only_owning_peer_without_deadline() {
+    smol::block_on(async {
+        let state = Arc::new(async_lock::Mutex::new(root_state()));
+        state.lock().await.sdk.continuous = true;
+        let params = state.lock().await.params.clone();
+        let genesis = Final {
+            hash: state.lock().await.tree.finalized().hash(),
+            slot: 0,
+        };
+        let platform = platform(Control {
+            handshake: handshake_frame(genesis, vec![]),
+            supported: true,
+            ..Control::default()
+        });
+        let key = trie::state_key(8);
+        let (root, proof) = active_set_trie(&[7; 33]);
+        {
+            let mut c = platform.0.lock().unwrap();
+            c.io.stall_outbound = true;
+            c.io.state_responses.push_back(Ok(proof));
+        }
+        let read = StateRead {
+            at: [1; 32],
+            root,
+            trust: Trust::Finalized,
+            root_header: Some([1; 32]),
+            request: StateRequest {
+                block: [1; 32],
+                start: key,
+                end: key,
+                max_size: 4000,
+            },
+        };
+        let rx = state.lock().await.reads.start(read.clone()).unwrap();
+        let mut size = FetchSize::default();
+        let mut probe = None;
+        let driver = async {
+            let end = drive_connection(
+                &platform,
+                "cancel-state",
+                &params,
+                0,
+                &state,
+                fake_connection(&platform),
+                (&mut size, &mut probe),
+            )
+            .await;
+            panic!(
+                "cancellation driver ended: {end:?}; {:?}",
+                platform.0.lock().unwrap().io.log_fields
+            );
+        };
+        let scenario = async {
+            yield_until(async || platform.0.lock().unwrap().io.stalled_openings == 1).await;
+            assert!(!state.lock().await.reads.canceled_owner(1));
+            drop(rx);
+            yield_until(async || state.lock().await.reads.owner.is_none()).await;
+            let mut next = read;
+            next.at = [3; 32];
+            next.request.block = next.at;
+            let expected = next.request.encode();
+            let rx = state.lock().await.reads.start(next).unwrap();
+            // Release the OLD opening after a NEW request can own this peer.
+            // Its old request ID must not attach to or steal the replacement.
+            platform.0.lock().unwrap().io.stall_outbound = false;
+            assert_eq!(
+                rx.await.unwrap().unwrap().range.entries,
+                vec![(key, vec![7; 33])]
+            );
+            assert!(!state.lock().await.stopped);
+            let c = platform.0.lock().unwrap();
+            assert_eq!(c.io.state_requests, vec![expected.to_vec()]);
+        };
+        while_driving(5, "in-flight state cancellation", driver, scenario).await;
+    });
+}

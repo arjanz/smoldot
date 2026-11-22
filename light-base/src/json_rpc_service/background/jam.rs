@@ -20,6 +20,7 @@
 use crate::{platform::PlatformRef, sync_service};
 use alloc::{
     borrow::Cow,
+    boxed::Box,
     collections::{BTreeMap, BTreeSet},
     string::{String, ToString as _},
     vec,
@@ -36,7 +37,7 @@ const JAM_PIN_BYTES: usize = 4 * 1024 * 1024;
 const JAM_PIN_COUNT: usize = 512;
 
 /// The methods a JAM chain answers, as `rpc_methods` lists them.
-const METHODS: [&str; 8] = [
+const METHODS: [&str; 15] = [
     "chainSpec_v1_chainName",
     "chainSpec_v1_genesisHash",
     "chainSpec_v1_properties",
@@ -45,6 +46,13 @@ const METHODS: [&str; 8] = [
     "jamHead_unstable_unfollow",
     "jamHead_unstable_unpin",
     "rpc_methods",
+    "jam_parameters",
+    "jam_block",
+    "jam_parent",
+    "jam_header",
+    "jam_verificationContext",
+    "jam_stateValue",
+    "jam_cancel",
 ];
 
 struct JamFollow {
@@ -193,27 +201,48 @@ pub(crate) async fn run_jam<P: PlatformRef>(
     let max_follows = usize::try_from(config.max_subscriptions).unwrap_or(usize::MAX);
     let mut follows: BTreeMap<String, JamFollow> = BTreeMap::new();
     let mut sequence = 0u64;
+    let mut pending = stream::FuturesUnordered::<
+        futures_util::future::BoxFuture<'static, (String, Option<String>)>,
+    >::new();
+    let mut aborts = BTreeMap::<String, futures_util::future::AbortHandle>::new();
     loop {
         enum Wake {
             Request(Result<String, async_channel::RecvError>),
             Block(String, Option<sync_service::Notification>),
+            Query((String, Option<String>)),
         }
-        let wake =
-            futures_lite::future::or(async { Wake::Request(requests.recv().await) }, async {
-                let mut waits = stream::FuturesUnordered::new();
-                for (id, follow) in &follows {
-                    waits.push(async move {
-                        Wake::Block(id.clone(), follow.notifications.recv().await.ok())
-                    });
-                }
-                match waits.next().await {
-                    Some(wake) => wake,
-                    None => futures_lite::future::pending().await,
-                }
-            })
-            .await;
+        let wake = futures_lite::future::or(
+            async { Wake::Request(requests.recv().await) },
+            futures_lite::future::or(
+                async {
+                    let mut waits = stream::FuturesUnordered::new();
+                    for (id, follow) in &follows {
+                        waits.push(async move {
+                            Wake::Block(id.clone(), follow.notifications.recv().await.ok())
+                        });
+                    }
+                    match waits.next().await {
+                        Some(wake) => wake,
+                        None => futures_lite::future::pending().await,
+                    }
+                },
+                async {
+                    match pending.next().await {
+                        Some(answer) => Wake::Query(answer),
+                        None => futures_lite::future::pending().await,
+                    }
+                },
+            ),
+        )
+        .await;
         match wake {
             Wake::Request(Err(_)) => return,
+            Wake::Query((key, answer)) => {
+                aborts.remove(&key);
+                if let Some(answer) = answer {
+                    let _ = responses.send(answer).await;
+                }
+            }
             Wake::Block(id, notification) => {
                 let Some(follow) = follows.get_mut(&id) else {
                     continue;
@@ -233,6 +262,122 @@ pub(crate) async fn run_jam<P: PlatformRef>(
                 }
             }
             Wake::Request(Ok(request)) => {
+                // These methods are an explicitly pinned in-process extension,
+                // not standard JIP-2 or Substrate RPC methods.
+                if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&request)
+                    && let Some(method) = raw.get("method").and_then(|m| m.as_str())
+                    && method.starts_with("jam_")
+                {
+                    if method == "jam_cancel" && raw.get("id").is_none() {
+                        if raw.get("jsonrpc").and_then(|v| v.as_str()) == Some("2.0")
+                            && let Some(p) = raw
+                                .get("params")
+                                .and_then(|v| v.as_array())
+                                .filter(|p| p.len() == 1)
+                            && let Some(handle) = aborts.remove(&p[0].to_string())
+                        {
+                            handle.abort();
+                        }
+                        continue;
+                    }
+                    let Some(id) = raw.get("id").cloned() else {
+                        continue;
+                    };
+                    let key = id.to_string();
+                    let params = raw
+                        .get("params")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!([]));
+                    let make_error = |code, message| {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,
+                        "error":{"code":code,"message":message}})
+                        .to_string()
+                    };
+                    if raw.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0")
+                        || !(id.is_string() || id.is_i64() || id.is_u64() || id.is_null())
+                    {
+                        let _ = responses
+                            .send(make_error(-32600, "invalid JSON-RPC request"))
+                            .await;
+                        continue;
+                    }
+                    if method == "jam_cancel" {
+                        if let Some(cancel) = params
+                            .as_array()
+                            .filter(|p| p.len() == 1)
+                            .map(|p| p[0].to_string())
+                        {
+                            if let Some(handle) = aborts.remove(&cancel) {
+                                handle.abort();
+                            }
+                            let _ = responses
+                                .send(
+                                    serde_json::json!({"jsonrpc":"2.0","id":id,"result":null})
+                                        .to_string(),
+                                )
+                                .await;
+                        } else {
+                            let _ = responses
+                                .send(make_error(-32602, "invalid cancellation parameters"))
+                                .await;
+                        }
+                        continue;
+                    }
+                    if !METHODS.contains(&method) {
+                        let _ = responses.send(make_error(-32601, "method not found")).await;
+                        continue;
+                    }
+                    if pending.len()
+                        >= usize::try_from(config.max_pending_requests.get())
+                            .unwrap_or(64)
+                            .min(64)
+                        || aborts.contains_key(&key)
+                    {
+                        let _ = responses
+                            .send(make_error(-32041, "JAM SDK request capacity exhausted"))
+                            .await;
+                        continue;
+                    }
+                    let (abort, registration) = futures_util::future::AbortHandle::new_pair();
+                    aborts.insert(key.clone(), abort);
+                    let sync = config.sync_service.clone();
+                    let method = method.to_string();
+                    let platform = config.platform.clone();
+                    pending.push(Box::pin(async move {
+                        let cancel_id = id.clone();
+                        let operation = async {
+                            let answer =
+                                futures_lite::future::or(sync.sdk_request(method, params), async {
+                                    platform.sleep(core::time::Duration::from_secs(30)).await;
+                                    Err(sync_service::jam::SdkError {
+                                        code: -32040,
+                                        message: "JAM proof request deadline elapsed",
+                                    })
+                                })
+                                .await;
+                            match answer {
+                                Ok(value) => {
+                                    serde_json::json!({"jsonrpc":"2.0","id":id,"result":value})
+                                        .to_string()
+                                }
+                                Err(error) => serde_json::json!({"jsonrpc":"2.0","id":id,
+                                    "error":{"code":error.code,"message":error.message}})
+                                .to_string(),
+                            }
+                        };
+                        let answer =
+                            match futures_util::future::Abortable::new(operation, registration)
+                                .await
+                            {
+                                Ok(answer) => answer,
+                                Err(_) => serde_json::json!({"jsonrpc":"2.0","id":cancel_id,
+                                "error":{"code":-32800,"message":"JAM SDK request cancelled"}})
+                                .to_string(),
+                            };
+                        (key, Some(answer))
+                    }));
+                    continue;
+                }
                 let (request_id, method) = match methods::parse_jsonrpc_client_to_server(&request) {
                     Ok(parsed) => parsed,
                     Err(methods::ParseClientToServerError::JsonRpcParse(_)) => {

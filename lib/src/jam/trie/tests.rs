@@ -634,3 +634,23 @@ fn external_ce129_corpus_and_join_state() {
         )
         .unwrap();
 }
+
+#[test]
+fn complete_state_commitment_matches_independent_prover_and_large_service_code() {
+    let key = state_key(7);
+    let value = vec![42; 4_000_000];
+    let map = BTreeMap::from([(key, value.clone()), (state_key(9), vec![])]);
+    let (expected, nodes) = prove(&map, key, key);
+    let entries: Vec<_> = map.iter().map(|(k, v)| (*k, v.clone())).collect();
+    assert_eq!(state_root(&entries).unwrap(), expected);
+    let response = StateResponse {
+        nodes,
+        entries: vec![(key, value.clone())],
+    };
+    assert_eq!(
+        verify_value(&expected, &[0; 32], &key, &response).unwrap(),
+        Some(value)
+    );
+    assert!(state_root(&[entries[0].clone(), entries[0].clone()]).is_err());
+    assert_eq!(state_root(&[]).unwrap(), [0; 32]);
+}

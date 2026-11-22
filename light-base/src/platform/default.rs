@@ -35,6 +35,9 @@
 //! ```
 //!
 
+#[path = "native_webtransport.rs"]
+mod native_webtransport;
+
 use super::{
     Address, ConnectionType, IpAddr, LogLevel, MultiStreamAddress, MultiStreamWebRtcConnection,
     PlatformRef, SubstreamDirection, with_buffers,
@@ -49,7 +52,9 @@ use core::{
     time::Duration,
 };
 use futures_util::{FutureExt as _, future};
+use parking_lot::{Condvar, Mutex};
 use smoldot::libp2p::websocket;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     io,
     net::SocketAddr,
@@ -63,7 +68,16 @@ pub struct DefaultPlatform {
     client_version: String,
     tasks_executor: Arc<smol::Executor<'static>>,
     shutdown_notify: event_listener::Event,
+    native_webtransport: native_webtransport::Runtime,
+    workers: Mutex<Vec<thread::JoinHandle<()>>>,
+    tasks: Mutex<slab::Slab<future::AbortHandle>>,
+    tasks_changed: Condvar,
+    stopped: AtomicBool,
 }
+
+// Task panics are caught after the ownership guard is installed. Registry
+// operations are atomic under their mutexes; transport state is independently owned.
+impl std::panic::RefUnwindSafe for DefaultPlatform {}
 
 impl DefaultPlatform {
     /// Creates a new [`DefaultPlatform`].
@@ -83,6 +97,7 @@ impl DefaultPlatform {
         let tasks_executor = Arc::new(smol::Executor::new());
         let shutdown_notify = event_listener::Event::new();
 
+        let mut workers = Vec::new();
         for n in 0..thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
@@ -96,8 +111,15 @@ impl DefaultPlatform {
                 .name(format!("smoldot-light-{}", n))
                 .spawn(move || smol::block_on(tasks_executor.run(on_shutdown)));
 
-            if let Err(err) = spawn_result {
-                panic!("Failed to spawn execution thread: {err}");
+            match spawn_result {
+                Ok(worker) => workers.push(worker),
+                Err(err) => {
+                    shutdown_notify.notify(usize::MAX);
+                    for worker in workers {
+                        let _ = worker.join();
+                    }
+                    panic!("Failed to spawn execution thread: {err}");
+                }
             }
         }
 
@@ -106,21 +128,81 @@ impl DefaultPlatform {
             client_version,
             tasks_executor,
             shutdown_notify,
+            native_webtransport: native_webtransport::Runtime::new(),
+            workers: Mutex::new(workers),
+            tasks: Mutex::new(slab::Slab::new()),
+            tasks_changed: Condvar::new(),
+            stopped: AtomicBool::new(false),
         })
+    }
+    /// Stops platform-owned tasks and joins native workers.
+    ///
+    /// Remove the client's chains and drop its core `Client` before calling this.
+    /// Call outside the platform's worker threads and outside any Python GIL.
+    /// Cooperative task cancellation has a three-second deadline.
+    pub fn shutdown(&self) -> io::Result<()> {
+        let current = thread::current().id();
+        if self
+            .workers
+            .lock()
+            .iter()
+            .any(|worker| worker.thread().id() == current)
+        {
+            return Err(io::Error::other(
+                "platform shutdown must run outside a smoldot worker",
+            ));
+        }
+        let handles = {
+            let tasks = self.tasks.lock();
+            self.stopped.store(true, Ordering::Release);
+            tasks
+                .iter()
+                .map(|(_, handle)| handle.clone())
+                .collect::<Vec<_>>()
+        };
+        for handle in handles {
+            handle.abort();
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut tasks = self.tasks.lock();
+        while !tasks.is_empty() {
+            if self
+                .tasks_changed
+                .wait_until(&mut tasks, deadline)
+                .timed_out()
+                && !tasks.is_empty()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "platform tasks did not stop",
+                ));
+            }
+        }
+        drop(tasks);
+        self.shutdown_notify.notify(usize::MAX);
+        let workers = core::mem::take(&mut *self.workers.lock());
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| io::Error::other("smoldot worker panicked"))?;
+        }
+        self.native_webtransport.shutdown();
+        Ok(())
     }
 }
 
 impl PlatformRef for Arc<DefaultPlatform> {
     type Delay = futures_util::future::Map<smol::Timer, fn(Instant) -> ()>;
     type Instant = Instant;
-    type MultiStream = std::convert::Infallible; // TODO: replace with `!` once stable: https://github.com/rust-lang/rust/issues/35121
+    type MultiStream = native_webtransport::Connection;
     type Stream = Stream;
     type StreamConnectFuture = future::Ready<Self::Stream>;
-    type MultiStreamConnectFuture = future::Pending<MultiStreamWebRtcConnection<Self::MultiStream>>;
+    type MultiStreamConnectFuture = future::Ready<MultiStreamWebRtcConnection<Self::MultiStream>>;
     type ReadWriteAccess<'a> = with_buffers::ReadWriteAccess<'a, Instant>;
     type StreamUpdateFuture<'a> = future::BoxFuture<'a, ()>;
     type StreamErrorRef<'a> = &'a io::Error;
-    type NextSubstreamFuture<'a> = future::Pending<Option<(Self::Stream, SubstreamDirection)>>;
+    type NextSubstreamFuture<'a> =
+        future::BoxFuture<'a, Option<(Self::Stream, SubstreamDirection)>>;
 
     fn now_from_unix_epoch(&self) -> Duration {
         // Intentionally panic if the time is configured earlier than the UNIX EPOCH.
@@ -144,15 +226,25 @@ impl PlatformRef for Arc<DefaultPlatform> {
     }
 
     fn spawn_task(&self, _task_name: Cow<str>, task: impl Future<Output = ()> + Send + 'static) {
-        // In order to make sure that the execution threads don't stop if there are still
-        // tasks to execute, we hold a copy of the `Arc<DefaultPlatform>` inside of the task until
-        // it is finished.
-        let _dummy_keep_alive = self.clone();
+        let (handle, registration) = future::AbortHandle::new_pair();
+        let id = {
+            let mut tasks = self.tasks.lock();
+            if self.stopped.load(Ordering::Acquire) {
+                return;
+            }
+            tasks.insert(handle)
+        };
+        // The guard is owned even before the first poll, so cancellation always
+        // releases registration and the platform keep-alive.
+        let guard = TaskGuard {
+            platform: self.clone(),
+            id,
+        };
         self.tasks_executor
             .spawn(
                 panic::AssertUnwindSafe(async move {
-                    task.await;
-                    drop(_dummy_keep_alive);
+                    let _guard = guard;
+                    let _ = future::Abortable::new(task, registration).await;
                 })
                 .catch_unwind(),
             )
@@ -216,6 +308,8 @@ impl PlatformRef for Arc<DefaultPlatform> {
                 | ConnectionType::WebSocketIpv4 { .. }
                 | ConnectionType::WebSocketIpv6 { .. }
                 | ConnectionType::WebSocketDns { secure: false, .. }
+                | ConnectionType::WebTransportIpv4
+                | ConnectionType::WebTransportIpv6
         )
     }
 
@@ -273,7 +367,7 @@ impl PlatformRef for Arc<DefaultPlatform> {
                 let _ = tcp_socket.set_nodelay(true);
             }
 
-            match (tcp_socket, host_if_websocket) {
+            let socket = match (tcp_socket, host_if_websocket) {
                 (Ok(tcp_socket), Some(host)) => {
                     websocket::websocket_client_handshake(websocket::Config {
                         tcp_socket,
@@ -286,7 +380,8 @@ impl PlatformRef for Arc<DefaultPlatform> {
 
                 (Ok(tcp_socket), None) => Ok(TcpOrWs::Left(tcp_socket)),
                 (Err(err), _) => Err(err),
-            }
+            };
+            socket.map(future::Either::Left)
         };
 
         future::ready(Stream(with_buffers::WithBuffers::new(Box::pin(
@@ -294,20 +389,80 @@ impl PlatformRef for Arc<DefaultPlatform> {
         ))))
     }
 
-    fn connect_multistream(&self, _address: MultiStreamAddress) -> Self::MultiStreamConnectFuture {
-        panic!()
+    fn connect_multistream(&self, address: MultiStreamAddress) -> Self::MultiStreamConnectFuture {
+        let MultiStreamAddress::WebTransport {
+            ip,
+            port,
+            cert_hashes,
+        } = address
+        else {
+            unreachable!("unsupported connection type")
+        };
+        future::ready(MultiStreamWebRtcConnection {
+            connection: native_webtransport::Connection::new(
+                &self.native_webtransport,
+                ip,
+                port,
+                cert_hashes.into_owned(),
+            ),
+            local_tls_certificate_sha256: [0; 32],
+        })
     }
 
-    fn open_out_substream(&self, c: &mut Self::MultiStream) {
-        // This function can only be called with so-called "multi-stream" connections. We never
-        // open such connection.
-        match *c {}
+    fn connect_multistream_with_peer_key(
+        &self,
+        address: MultiStreamAddress,
+        peer_public_key: [u8; 65],
+    ) -> Self::MultiStreamConnectFuture {
+        let MultiStreamAddress::WebTransport { ip, port, .. } = address else {
+            return self.connect_multistream(address);
+        };
+        let mut hashes = Vec::new();
+        let identity = crate::jam_webtransport_cert::P256PeerId::from_parts(
+            peer_public_key[1..33].try_into().unwrap(),
+            peer_public_key[64] & 1 != 0,
+        );
+        match identity {
+            Ok(identity) if identity.to_uncompressed_sec1() == peer_public_key => {
+                hashes.extend(crate::jam_webtransport_cert::certificate_hashes(
+                    &identity,
+                    self.now_from_unix_epoch().as_secs(),
+                ));
+                hashes.extend(
+                    crate::jam_webtransport_cert::legacy_0129_certificate_hashes(
+                        &identity,
+                        self.now_from_unix_epoch().as_secs(),
+                    ),
+                );
+            }
+            // Reject an invalid supplied identity even if its address has valid
+            // certificate hashes. Never degrade to a weaker identity policy.
+            _ => hashes.clear(),
+        }
+        future::ready(MultiStreamWebRtcConnection {
+            connection: native_webtransport::Connection::new(
+                &self.native_webtransport,
+                ip,
+                port,
+                hashes,
+            ),
+            local_tls_certificate_sha256: [0; 32],
+        })
     }
 
-    fn next_substream(&self, c: &mut Self::MultiStream) -> Self::NextSubstreamFuture<'_> {
-        // This function can only be called with so-called "multi-stream" connections. We never
-        // open such connection.
-        match *c {}
+    fn open_out_substream(&self, connection: &mut Self::MultiStream) {
+        connection.open();
+    }
+
+    fn next_substream<'a>(
+        &self,
+        connection: &'a mut Self::MultiStream,
+    ) -> Self::NextSubstreamFuture<'a> {
+        Box::pin(connection.next())
+    }
+
+    fn stream_reset_code(&self, error: &&io::Error) -> Option<u32> {
+        native_webtransport::reset_code(error)
     }
 
     fn read_write_access<'a>(
@@ -332,6 +487,25 @@ impl PlatformRef for Arc<DefaultPlatform> {
 impl Drop for DefaultPlatform {
     fn drop(&mut self) {
         self.shutdown_notify.notify(usize::MAX);
+        self.native_webtransport.shutdown();
+        let current = thread::current().id();
+        for worker in core::mem::take(self.workers.get_mut()) {
+            if worker.thread().id() != current {
+                let _ = worker.join();
+            }
+        }
+    }
+}
+
+struct TaskGuard {
+    platform: Arc<DefaultPlatform>,
+    id: usize,
+}
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        self.platform.tasks.lock().remove(self.id);
+        self.platform.tasks_changed.notify_all();
     }
 }
 
@@ -340,11 +514,21 @@ impl Drop for DefaultPlatform {
 pub struct Stream(
     #[pin]
     with_buffers::WithBuffers<
-        future::BoxFuture<'static, Result<TcpOrWs, io::Error>>,
-        TcpOrWs,
+        future::BoxFuture<'static, Result<Socket, io::Error>>,
+        Socket,
         Instant,
     >,
 );
+
+impl Stream {
+    fn webtransport(stream: native_webtransport::Stream) -> Self {
+        Self(with_buffers::WithBuffers::new(Box::pin(future::ready(Ok(
+            future::Either::Right(stream),
+        )))))
+    }
+}
+
+type Socket = future::Either<TcpOrWs, native_webtransport::Stream>;
 
 type TcpOrWs = future::Either<smol::net::TcpStream, websocket::Connection<smol::net::TcpStream>>;
 
@@ -370,5 +554,31 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(None)));
         platform_destroyed.notify(usize::MAX);
         assert!(matches!(smol::block_on(rx), Ok(())));
+    }
+
+    #[test]
+    fn shutdown_cancels_owned_tasks_and_joins_workers() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct Released(Arc<AtomicBool>);
+        impl Drop for Released {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let platform = DefaultPlatform::new("test".into(), "1".into());
+        let released = Arc::new(AtomicBool::new(false));
+        let guard = Released(released.clone());
+        platform.spawn_task("pending".into(), async move {
+            let _guard = guard;
+            futures_lite::future::pending::<()>().await;
+        });
+        platform.shutdown().unwrap();
+        assert!(released.load(Ordering::Acquire));
+        assert!(platform.workers.lock().is_empty());
+        assert!(platform.tasks.lock().is_empty());
+        platform.shutdown().unwrap();
     }
 }

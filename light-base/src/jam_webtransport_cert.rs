@@ -166,10 +166,21 @@ fn date_time(timestamp: u64) -> time::OffsetDateTime {
 /// Rebuilds PolkaJam's deterministic certificate, including its 64-byte zero signature: subject
 /// and issuer `CN=<peer ID text>`, the period index as serial number.
 pub fn certificate_der(id: &P256PeerId, period: ValidityPeriod) -> Vec<u8> {
+    certificate_der_profile(id, period, false)
+}
+
+// Explicit compatibility with the public PolkaJAM 0.1.29 release: its issuer
+// and subject are CN=jam and its serial is zero. The key, SAN, validity and fake
+// certificate signature are otherwise identical. This encoding is native-only:
+// browsers retain the newer per-peer issuer/serial policy (NSS compatibility).
+fn certificate_der_profile(id: &P256PeerId, period: ValidityPeriod, legacy_0129: bool) -> Vec<u8> {
     let text = id.to_text();
-    let name = name(text.as_bytes());
+    let name = name(if legacy_0129 { b"jam" } else { text.as_bytes() });
     let mut tbs = vec![0xa0, 3, 2, 1, 2]; // v3
-    tbs.extend_from_slice(&tlv(2, &serial_integer(period.0)));
+    tbs.extend_from_slice(&tlv(
+        2,
+        &serial_integer(if legacy_0129 { 0 } else { period.0 }),
+    ));
     tbs.extend_from_slice(ED25519_ALGORITHM);
     tbs.extend_from_slice(&name); // issuer
     let mut validity = der_time(period.begin());
@@ -206,6 +217,17 @@ pub fn certificate_hashes(p256_id: &P256PeerId, now_unix_secs: u64) -> [[u8; 32]
     let period = ValidityPeriod::from_unix_secs(now_unix_secs).0;
     [period.saturating_sub(1), period, period.saturating_add(1)]
         .map(|period| sha2::Sha256::digest(certificate_der(p256_id, ValidityPeriod(period))).into())
+}
+
+/// Additional deterministic certificate pins for the public PolkaJAM 0.1.29
+/// native transport profile. Every pin is derived from the authenticated peer
+/// identity; unknown certificate encodings remain rejected.
+#[cfg(any(feature = "std", test))]
+pub(crate) fn legacy_0129_certificate_hashes(id: &P256PeerId, now_unix_secs: u64) -> [[u8; 32]; 3] {
+    let period = ValidityPeriod::from_unix_secs(now_unix_secs).0;
+    [period.saturating_sub(1), period, period.saturating_add(1)].map(|period| {
+        sha2::Sha256::digest(certificate_der_profile(id, ValidityPeriod(period), true)).into()
+    })
 }
 
 /// A distinguished name with one common name, a UTF8String, as rcgen writes it.

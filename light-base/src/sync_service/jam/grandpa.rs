@@ -94,7 +94,25 @@ impl State {
             limits,
             |hash| self.tree.get(hash).and_then(finality::ancestry_link),
         )?;
-        let result = self.tree.finalize(&verified, &mut self.authorities)?;
+        let roots = self.sdk_finality_records(&verified);
+        if self.sdk.continuous
+            && roots.iter().any(|record| {
+                self.sdk
+                    .certified_root(&record.hash)
+                    .is_some_and(|known| known != record.root)
+            })
+        {
+            // A certificate cannot silently rewrite a trusted or previously
+            // finalized posterior commitment, even for the same header hash.
+            return Err(finality::Error::TargetMismatch);
+        }
+        let mut result = self.tree.finalize(&verified, &mut self.authorities)?;
+        for record in roots {
+            self.sdk.remember(record);
+        }
+        let before_reconcile = self.tree.best().hash();
+        result.pruned.extend(self.sdk_reconcile_tree());
+        result.best_changed |= before_reconcile != self.tree.best().hash();
         if result.finalized.is_empty() {
             return Ok(());
         }

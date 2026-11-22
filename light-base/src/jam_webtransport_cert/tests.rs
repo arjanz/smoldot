@@ -435,3 +435,32 @@ fn from_parts_round_trips_with_generated_keys() {
         assert_eq!(P256PeerId::from_parts(*id.x(), id.y_odd()), Ok(id));
     }
 }
+
+// Captured during an always-rejecting TLS handshake with the public macOS ARM64
+// PolkaJAM 0.1.29 release on 2026-11-22. Binary SHA256:
+// 30a8af4d529033108f41374a021862b10faec89c50637e481f8e4d6a27e85ed8.
+// The fixture is a public certificate, never a private key or a trusted result oracle.
+#[test]
+fn legacy_0129_certificate_matches_public_release_capture() {
+    let id =
+        P256PeerId::from_text("oqov2a57d7etnpzb6aerv64y5j622ejkkvqjencdrwln4qhnoqvqb").unwrap();
+    let expected = hex::decode("3082013d3081f0a003020102020100300506032b6570300e310c300a06035504030c036a616d301e170d3236313131323030303030305a170d3236313132343030303030305a300e310c300a06035504030c036a616d3059301306072a8648ce3d020106082a8648ce3d03010703420004d0550dfa1f9fccf672f080c4ea39eec96b4d92521526d2c48876350e4f73b0c2aa37b01f6601d9813173fadcad094b1f9675058c2a70d3249bf1e61e5cb180dba344304230400603551d110439303782356f716f7632613537643765746e707a623661657276363479356a363232656a6b6b76716a656e636472776c6e3471686e6f71767162300506032b657003410000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000").unwrap();
+    let actual = certificate_der_profile(&id, ValidityPeriod(2077), true);
+    assert_eq!(actual, expected);
+    assert_eq!(
+        hex::encode(sha2::Sha256::digest(&actual)),
+        "dac6fe8d73aee1392061d82077055a8872bbbbe5c14cf2cbcacd9ed6b1cebb58"
+    );
+    assert!(
+        legacy_0129_certificate_hashes(&id, 2077 * 864_000)
+            .contains(&sha2::Sha256::digest(&actual).into())
+    );
+    assert!(
+        !certificate_hashes(&id, 2077 * 864_000).contains(&sha2::Sha256::digest(&actual).into())
+    );
+    let different = key(7);
+    assert!(
+        !legacy_0129_certificate_hashes(&different, 2077 * 864_000)
+            .contains(&sha2::Sha256::digest(&actual).into())
+    );
+}

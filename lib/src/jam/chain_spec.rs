@@ -30,6 +30,8 @@ pub struct JamChainSpec {
     params: Params,
     genesis_header: Header,
     genesis_light_state: GenesisLightState,
+    genesis_state_root: Option<[u8; 32]>,
+    jamsdk_disable_warp: bool,
     checkpoint: Option<Checkpoint>,
     boot_nodes: Vec<BootNode>,
 }
@@ -38,6 +40,9 @@ pub struct JamChainSpec {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Checkpoint {
     pub header: Header,
+    /// Optional caller-trusted posterior root for SDK reads at this checkpoint.
+    /// This is never learned automatically from a peer.
+    pub state_root: Option<[u8; 32]>,
     pub state: GenesisLightState,
     /// Trusted GRANDPA state after finalizing this header.
     pub finality: AuthoritySet,
@@ -159,6 +164,8 @@ fn json_object<T: serde::de::DeserializeOwned>(json: &[u8]) -> Result<T, serde_j
 
 #[derive(Deserialize)]
 struct RawSpec {
+    #[serde(default)]
+    jamsdk_disable_warp: bool,
     id: String,
     protocol_parameters: String,
     genesis_header: String,
@@ -171,6 +178,8 @@ struct RawSpec {
 #[derive(Deserialize)]
 struct RawCheckpoint {
     header: String,
+    #[serde(default)]
+    state_root: Option<String>,
     state: RawCheckpointState,
     finality: Option<RawFinality>,
 }
@@ -294,6 +303,7 @@ impl JamChainSpec {
             |bytes| Header::decode(&params, bytes),
         )?;
         let mut items = Vec::new();
+        let mut all_items = Vec::new();
         for (key, value) in raw.genesis_state.0 {
             let bytes = hex_bytes(&format!("genesis_state key {key}"), &key)?;
             let actual = bytes.len();
@@ -305,6 +315,7 @@ impl JamChainSpec {
             // Even unused entries must be well-formed hex, but their contents
             // need not be understood by a header-only client.
             let bytes = hex_bytes(&field, &value)?;
+            all_items.push((decoded_key, bytes.clone()));
             if [4, 6, 8, 11]
                 .into_iter()
                 .any(|i| decoded_key == codec::state_key(i))
@@ -314,6 +325,22 @@ impl JamChainSpec {
         }
         let genesis_light_state = state(&params, "genesis_state", &items)?;
         check_slot("genesis_state", &genesis_header, &genesis_light_state)?;
+        all_items.sort_by_key(|(key, _)| *key);
+        // Header-only exports are not complete posterior state commitments.
+        let complete = (1u8..=16).all(|index| {
+            all_items
+                .binary_search_by_key(&codec::state_key(index), |(key, _)| *key)
+                .is_ok()
+        });
+        let genesis_state_root = if complete {
+            Some(
+                super::trie::state_root(&all_items).map_err(|_| Error::InvalidParameters {
+                    field: "genesis_state",
+                })?,
+            )
+        } else {
+            None
+        };
         let checkpoint = raw
             .checkpoint
             .map(|raw| {
@@ -342,6 +369,16 @@ impl JamChainSpec {
                         checkpoint: header.slot,
                     });
                 }
+                let state_root = raw
+                    .state_root
+                    .map(|value| {
+                        hex_bytes("checkpoint.state_root", &value)?
+                            .try_into()
+                            .map_err(|_| Error::InvalidParameters {
+                                field: "checkpoint.state_root",
+                            })
+                    })
+                    .transpose()?;
                 let raw = raw.finality.ok_or(Error::MissingField {
                     field: "checkpoint.finality",
                 })?;
@@ -375,6 +412,7 @@ impl JamChainSpec {
                 })?;
                 Ok(Checkpoint {
                     header,
+                    state_root,
                     state,
                     finality,
                 })
@@ -393,9 +431,20 @@ impl JamChainSpec {
             params,
             genesis_header,
             genesis_light_state,
+            genesis_state_root,
+            jamsdk_disable_warp: raw.jamsdk_disable_warp,
             checkpoint,
             boot_nodes,
         })
+    }
+
+    /// Posterior commitment of the complete caller-trusted genesis map.
+    pub fn jamsdk_disable_warp(&self) -> bool {
+        self.jamsdk_disable_warp
+    }
+
+    pub fn genesis_state_root(&self) -> Option<[u8; 32]> {
+        self.genesis_state_root
     }
 
     pub fn id(&self) -> &str {

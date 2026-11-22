@@ -38,7 +38,7 @@ impl Ce129 {
         if !self.fin_sent {
             return Ok(None);
         }
-        let max = max.min(1024 * 1024);
+        let max = max.min(32 * 1024 * 1024);
         if self.nodes.is_none() {
             self.nodes = self.reader.read(input, max.min(496 * 64))?;
             if self.nodes.is_none() {

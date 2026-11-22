@@ -1546,3 +1546,43 @@ fn captured_ce128_no_data_resets_leave_connection_usable(
         Some(Event::BlockResponse { request_id, blocks }) if request_id == next && blocks.len() == capture.blocks.len())
     );
 }
+
+#[test]
+fn sdk_max_service_preimage_crosses_ce129_frame_and_proof_layers() {
+    let key = [7; 31];
+    let value = vec![42; 4_000_000];
+    let mut node = [0; 64];
+    node[0] = 0xc0;
+    node[1..32].copy_from_slice(&key);
+    node[32..].copy_from_slice(&crate::jam::crypto::blake2b_256(&value));
+    let root = crate::jam::crypto::blake2b_256(&node);
+    let req = StateRequest {
+        block: [1; 32],
+        start: key,
+        end: key,
+        max_size: 1_000_000,
+    };
+    let mut c =
+        connection_with(|limits| limits.max_message_size = 32 * 1024 * 1024 + 496 * 64).unwrap();
+    c.set_state_message_size(32 * 1024 * 1024 + 496 * 64)
+        .unwrap();
+    open_up(&mut c);
+    let id = sent(&mut c, Req::State(req.clone()));
+    let mut entries = key.to_vec();
+    entries.extend(crate::jam::codec::encode_natural(value.len() as u64));
+    entries.extend(&value);
+    let wire = [frame(&node), frame(&entries)].concat();
+    assert!(feed(&mut c, 2, &wire, 65536).is_empty());
+    let Some(Event::StateResponse {
+        request_id,
+        response,
+    }) = c.read_write(2, &[], true, &mut []).event
+    else {
+        panic!("4MB preimage must pass native framing")
+    };
+    assert_eq!(request_id, id);
+    assert_eq!(
+        crate::jam::trie::verify_value(&root, &req.block, &key, &response).unwrap(),
+        Some(value)
+    );
+}

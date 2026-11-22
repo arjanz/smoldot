@@ -149,6 +149,7 @@ fn external_full_parameter_1200_blocks_interleave_finality() {
             control.handshake = handshake_frame(final_of(&params, &headers[1199]), vec![]);
         }
         let config = Config {
+            sdk: sdk::SdkState::empty(),
             params: params.clone(),
             tree: HeaderTree::new(params.clone(), root, limits).unwrap(),
             peers: vec![],
@@ -339,5 +340,51 @@ fn external_oversized_batch_retries_with_persistent_lower_ceiling() {
             c.requests.iter().map(|r| r.max_blocks).collect::<Vec<_>>(),
             vec![8, 4, 2, 2, 2, 2, 2]
         );
+    });
+}
+
+#[test]
+fn two_peer_catchup_defers_batched_headers_while_epoch_budget_awaits_finality() {
+    smol::block_on(async {
+        let (platform, mut config, _) = synthetic_driver(240, 1024);
+        config.sdk.continuous = true;
+        let params = config.params.clone();
+        let state = driver_state(config);
+        platform.0.lock().unwrap().io.hold_proofs = true;
+        let peers = future::or(
+            drive_scripted(&platform, &params, &state, 0, 64),
+            drive_scripted(&platform, &params, &state, 1, 64),
+        );
+        let scenario = async {
+            yield_until(async || state.lock().await.tree.epoch_records() >= 7).await;
+            {
+                let s = state.lock().await;
+                assert_eq!(s.tree.finalized().slot(), 0);
+                assert_eq!(s.tree.epoch_records(), 7);
+                assert!(s.proof_owner.is_some());
+                assert!(s.pause_imports_for_proof());
+                assert!(!s.stopped);
+            }
+            // One CE128 batch is already in memory. It must stay deferred while
+            // the other peer's CE130 response is delayed, rather than halt sync.
+            for _ in 0..50 {
+                future::yield_now().await;
+                let s = state.lock().await;
+                assert_eq!(s.tree.epoch_records(), 7);
+                assert!(!s.stopped);
+            }
+            platform.0.lock().unwrap().io.hold_proofs = false;
+            yield_until(async || state.lock().await.tree.finalized().slot() == 240).await;
+            let s = state.lock().await;
+            assert!(!s.stopped);
+            assert!(s.tree.epoch_records() <= 8);
+        };
+        while_driving(
+            20,
+            "two-peer delayed finality across 20 epochs",
+            peers,
+            scenario,
+        )
+        .await;
     });
 }

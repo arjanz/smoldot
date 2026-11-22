@@ -17,6 +17,10 @@ required-features = ["std"]
 name = "lifecycle"
 required-features = ["std"]
 
+[[example]]
+name = "jam_native"
+required-features = ["std"]
+
 [dependencies]
 async-channel = { version = "2.5.0", default-features = false }
 async-lock = { version = "3.0.0", default-features = false }
@@ -53,13 +57,17 @@ zeroize = { version = "1.7.0", default-features = false, features = ["alloc"] }
 parking_lot = { version = "0.12.1", optional = true }
 log = { version = "0.4.18", default-features = false, optional = true }
 smol = { version = "2.0.0", optional = true }
+tokio = { version = "1.48", default-features = false, features = ["rt-multi-thread", "time", "net", "io-util", "macros"], optional = true }
+tokio-util = { version = "0.7.16", default-features = false, features = ["compat"], optional = true }
+wtransport = { version = "=0.7.2", default-features = false, features = ["ring", "quinn"], optional = true }
 
 [features]
 default = ["std", "wasmtime"]
-std = ["dep:parking_lot", "dep:log", "dep:smol", "rand/std", "rand/std_rng", "smoldot/std"]
+std = ["dep:parking_lot", "dep:log", "dep:smol", "rand/std", "rand/std_rng", "smoldot/std", "dep:tokio", "dep:tokio-util", "dep:wtransport"]
 wasmtime = ["smoldot/wasmtime"]
 
 [dev-dependencies]
+wtransport = { version = "=0.7.2", default-features = false, features = ["ring", "quinn", "self-signed"] }
 # Tests only: seals synthetic JAM headers.
 ark-vrf = { version = "=0.2.2", default-features = false, features = ["bandersnatch"] }
 # Tests only: signs synthetic GRANDPA votes.

@@ -606,6 +606,9 @@ impl<P: PlatformRef> Conn<'_, P> {
                                     self.local_progress = true;
                                 }
                                 Ok(None) => {}
+                                Ok(Some(Err(StateReadError::InvalidProof))) => {
+                                    return Err(End::StateRejected);
+                                }
                                 Ok(Some(Err(StateReadError::Unavailable))) => {
                                     event!(
                                         self,

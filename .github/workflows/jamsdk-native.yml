@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+name: jamsdk-native
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jamsdk-native-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  jam-native:
+    name: JAM native (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install tested Rust toolchain
+        run: rustup toolchain install 1.99.1 --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: jamsdk-native-1.99.1
+      - name: Check existing no-std API
+        run: >-
+          cargo +1.99.1 check --locked -p smoldot-light --no-default-features
+      - name: Test core JAM protocol and proof fixtures
+        run: >-
+          cargo +1.99.1 test --locked -p smoldot --no-default-features --features std --lib jam::
+      - name: Test light JAM synchronization, reads, and certificates
+        run: >-
+          cargo +1.99.1 test --locked -p smoldot-light --no-default-features --features std --lib jam
+      - name: Test native transport ownership and pinned TLS
+        run: >-
+          cargo +1.99.1 test --locked -p smoldot-light --no-default-features --features std --lib platform::default
+      - name: Check native diagnostic example
+        run: >-
+          cargo +1.99.1 check --locked -p smoldot-light --no-default-features --features std --example jam_native

@@ -109,6 +109,15 @@ impl<T: PlatformRef> PlatformRef for WithPrefix<T> {
         self.inner.connect_multistream(address)
     }
 
+    fn connect_multistream_with_peer_key(
+        &self,
+        address: MultiStreamAddress,
+        peer_public_key: [u8; 65],
+    ) -> Self::MultiStreamConnectFuture {
+        self.inner
+            .connect_multistream_with_peer_key(address, peer_public_key)
+    }
+
     fn open_out_substream(&self, connection: &mut Self::MultiStream) {
         self.inner.open_out_substream(connection)
     }

@@ -38,6 +38,7 @@ mod discovery;
 mod grandpa;
 mod reads;
 mod rpc;
+mod sdk_tests;
 mod warp;
 
 impl Default for StateReads {
@@ -143,6 +144,7 @@ fn root_config() -> Config {
         0,
     );
     Config {
+        sdk: sdk::SdkState::empty(),
         tree: HeaderTree::new(
             params.clone(),
             verified_genesis(&params, header, state),
@@ -171,6 +173,7 @@ fn root_config() -> Config {
 /// The driver state for `config`, as [`run`] builds it.
 fn state(config: Config) -> State {
     State {
+        sdk: config.sdk,
         reads: StateReads::default(),
         tree: config.tree,
         params: config.params,
@@ -244,6 +247,7 @@ struct IoState {
     /// The platform reports no reset codes, as Firefox does.
     codeless: bool,
     proof_resets: VecDeque<Reset>,
+    hold_proofs: bool,
     block_resets: VecDeque<(Direction, Reset)>,
     logs: Vec<String>,
     log_fields: Vec<(String, BTreeMap<String, String>)>,
@@ -271,6 +275,7 @@ struct IoState {
 struct FakeConnection {
     control: Arc<Mutex<Control>>,
     streams: VecDeque<FakeStream>,
+    delayed_streams: VecDeque<FakeStream>,
     number: usize,
     dead: bool,
 }
@@ -558,6 +563,7 @@ impl PlatformRef for FakePlatform {
         let connection = FakeConnection {
             control: self.0.clone(),
             streams: VecDeque::new(),
+            delayed_streams: VecDeque::new(),
             number: 0,
             dead,
         };
@@ -575,6 +581,14 @@ impl PlatformRef for FakePlatform {
             let mut c = connection.control.lock().unwrap();
             if ce && c.io.stall_outbound {
                 c.io.stalled_openings += 1;
+                c.io.live_streams += 1;
+                drop(c);
+                connection.delayed_streams.push_back(FakeStream::new(
+                    &connection.control,
+                    self.now(),
+                    [].into(),
+                    true,
+                ));
                 return;
             }
         }
@@ -616,6 +630,11 @@ impl PlatformRef for FakePlatform {
                 if connection.dead {
                     return None;
                 }
+                if !connection.control.lock().unwrap().io.stall_outbound
+                    && let Some(stream) = connection.delayed_streams.pop_front()
+                {
+                    connection.streams.push_back(stream);
+                }
                 if let Some(stream) = connection.streams.pop_front() {
                     let direction = if stream.inbound {
                         SubstreamDirection::Inbound
@@ -643,6 +662,9 @@ impl PlatformRef for FakePlatform {
         }
         if stream.ce && !stream.response_started && stream.rw.write_bytes_queueable.is_none() {
             let mut c = stream.control.lock().unwrap();
+            if stream.outgoing[0] == 130 && c.io.hold_proofs {
+                return Ok(Access(&mut stream.rw));
+            }
             let response = match stream.outgoing[0] {
                 128 => c.blocks(BlockRequest::decode(&stream.outgoing[5..]).unwrap())?,
                 129 => c.state(stream.outgoing[5..].to_vec())?,
@@ -957,6 +979,7 @@ fn fake_connection(platform: &FakePlatform) -> FakeConnection {
     FakeConnection {
         control: platform.0.clone(),
         streams: VecDeque::new(),
+        delayed_streams: VecDeque::new(),
         number: 0,
         dead: false,
     }
