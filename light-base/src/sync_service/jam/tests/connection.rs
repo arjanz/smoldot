@@ -426,40 +426,69 @@ fn external_missing_parent_announcement_retained_and_captured_ce128_used() {
 
 #[test]
 fn external_established_disconnect_reconnect_catches_up_without_finalizing() {
-    smol::block_on(async {
-        let (platform, spec, first_hash, _) = fixture_setup();
-        let parsed = parse(&spec);
-        let params = parsed.params();
-        let service = sync_service(&platform, &parsed);
-        let snapshot = service.subscribe_all(16, false).await;
-        let first = received("initial sync", &snapshot.new_blocks).await;
-        assert_eq!(block_hash(&first), Some(first_hash));
-        let [second, third] = [1, 2].map(|index| fixture_header(params, index));
-        {
-            let mut c = platform.0.lock().unwrap();
-            serve(&mut c, params, &second);
-            serve(&mut c, params, &third);
-            c.handshake = handshake_frame(final_of(params, &third), Vec::new());
-            c.disconnect = true;
-        }
-        for header in [&second, &third] {
-            let notification = received("reconnect catch-up", &snapshot.new_blocks).await;
-            assert_eq!(block_hash(&notification), Some(header.hash(params)));
-        }
-        {
-            let c = platform.0.lock().unwrap();
-            assert_eq!(c.attempts, 2);
-            let requested: Vec<_> = c.requests.iter().map(|r| r.hash).collect();
-            assert_eq!(requested, [first_hash, second.hash(params)]);
-        }
-        assert_eq!(
-            service
-                .subscribe_all(1, false)
-                .await
-                .finalized_block_scale_encoded_header,
-            snapshot.finalized_block_scale_encoded_header
-        );
-    });
+    for pre_synced in [false, true] {
+        smol::block_on(async {
+            let (platform, spec, first_hash, _) = fixture_setup();
+            let parsed = parse(&spec);
+            let params = parsed.params();
+            let service = sync_service(&platform, &parsed);
+            if pre_synced {
+                let expected = prefixed(first_hash);
+                until(|| {
+                    platform
+                        .0
+                        .lock()
+                        .unwrap()
+                        .io
+                        .log_fields
+                        .iter()
+                        .any(|(event, fields)| {
+                            event == "jam-header-inserted" && fields.get("hash") == Some(&expected)
+                        })
+                })
+                .await;
+            }
+            let snapshot = service.subscribe_all(16, false).await;
+            if pre_synced {
+                assert_eq!(snapshot.non_finalized_blocks_ancestry_order.len(), 1);
+            }
+            // Import and subscribe may race on a multithreaded executor. The first
+            // header belongs either to the atomic snapshot or to the update stream;
+            // it is never required to appear in both.
+            let mut initial = snapshot.non_finalized_blocks_ancestry_order.into_iter();
+            let first = match initial.next() {
+                Some(block) => Notification::Block(block),
+                None => received("initial sync", &snapshot.new_blocks).await,
+            };
+            assert!(initial.next().is_none());
+            assert_eq!(block_hash(&first), Some(first_hash));
+            let [second, third] = [1, 2].map(|index| fixture_header(params, index));
+            {
+                let mut c = platform.0.lock().unwrap();
+                serve(&mut c, params, &second);
+                serve(&mut c, params, &third);
+                c.handshake = handshake_frame(final_of(params, &third), Vec::new());
+                c.disconnect = true;
+            }
+            for header in [&second, &third] {
+                let notification = received("reconnect catch-up", &snapshot.new_blocks).await;
+                assert_eq!(block_hash(&notification), Some(header.hash(params)));
+            }
+            {
+                let c = platform.0.lock().unwrap();
+                assert_eq!(c.attempts, 2);
+                let requested: Vec<_> = c.requests.iter().map(|r| r.hash).collect();
+                assert_eq!(requested, [first_hash, second.hash(params)]);
+            }
+            assert_eq!(
+                service
+                    .subscribe_all(1, false)
+                    .await
+                    .finalized_block_scale_encoded_header,
+                snapshot.finalized_block_scale_encoded_header
+            );
+        });
+    }
 }
 
 #[test]
